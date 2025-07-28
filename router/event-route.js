@@ -2,7 +2,6 @@ import { startGame, disconnect, revealCell, cashOut, randomCell } from '../servi
 
 export const registerEvents = async (socket) => {
     socket.on('message', (data) => {
-        console.log(data)
         const event = data.split(':')
         switch (event[0]) {
             case 'SG': return startGame(socket, event.slice(1, event.length));
@@ -11,5 +10,5 @@ export const registerEvents = async (socket) => {
             case 'CO': return cashOut(socket);
         }
     })
-    socket.on('disconnect', ()=> disconnect(socket));
+    socket.on('disconnect', () => disconnect(socket));
 }

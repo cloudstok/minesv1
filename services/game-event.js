@@ -9,23 +9,6 @@ const betLogger = createLogger('Bets', 'jsonl');
 const cashoutLogger = createLogger('Cashout', 'jsonl');
 const timers = new Map();
 
-const userLocks = new Map();
-
-const acquireLock = async (user_id) => {
-    while (userLocks.has(user_id)) {
-        await userLocks.get(user_id);
-    }
-    let resolveLock = () => { };
-    const lockPromise = new Promise((resolve) => {
-        resolveLock = resolve;
-    });
-    userLocks.set(user_id, lockPromise);
-    return () => {
-        resolveLock();
-        userLocks.delete(user_id);
-    };
-};
-
 const getPlayerDetailsAndGame = async (socket) => {
     const cachedPlayerDetails = await getCache(`PL:${socket.id}`);
     if (!cachedPlayerDetails) return { error: 'Invalid Player Details' };
@@ -39,25 +22,18 @@ const getPlayerDetailsAndGame = async (socket) => {
 };
 
 const generateTimerKeys = (playerId, matchId) => ({
-    timerKey: `${playerId}-${matchId}`,
     timerEventKey: `ET-${playerId}-${matchId}`,
 });
 
 const registerTimer = async (playerId, matchId, socket) => {
-    const { timerKey, timerEventKey } = generateTimerKeys(playerId, matchId);
+    const { timerEventKey } = generateTimerKeys(playerId, matchId);
     const timerEventId = setTimeout(() => socket.emit('auto_cashout', { timer: 10 }), 20 * 1000);
-    const timerId = setTimeout(async () => await cashOut(socket), 30 * 1000);
     timers.set(timerEventKey, timerEventId);
-    timers.set(timerKey, timerId);
 };
 
 export const clearTimer = async (playerId, matchId) => {
-    const { timerKey, timerEventKey } = generateTimerKeys(playerId, matchId);
+    const { timerEventKey } = generateTimerKeys(playerId, matchId);
 
-    if (timers.has(timerKey)) {
-        clearTimeout(timers.get(timerKey));
-        timers.delete(timerKey);
-    };
     if (timers.has(timerEventKey)) {
         clearTimeout(timers.get(timerEventKey));
         timers.delete(timerEventKey);
@@ -120,7 +96,6 @@ export const revealCell = async (socket, cellData) => {
 
 export const cashOut = async (socket) => {
     const { playerDetails, game, error } = await getPlayerDetailsAndGame(socket);
-    const releaseLock = await acquireLock(`PL:${playerDetails.id}`);
     try {
         if (error) return logEventAndEmitResponse({ socketId: socket.id }, error, 'cashout', socket);
         await clearTimer(playerDetails.id, game.matchId);
@@ -131,9 +106,7 @@ export const cashOut = async (socket) => {
     } catch (error) {
         console.error("Error during cash out:", error);
         cashoutLogger.error();
-    } finally {
-        releaseLock();
-    }
+    };
 };
 
 
