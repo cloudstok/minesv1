@@ -1,7 +1,8 @@
+import { playerGames } from "../../services/game-event.js";
 import { appConfig } from "../../utilities/app-config.js";
 import { updateBalanceFromAccount } from "../../utilities/common-function.js";
 import { countMinesAndRevealed, generateGrid, getNextMultiplier } from "../../utilities/helper-function.js";
-import { setCache, deleteCache } from "../../utilities/redis-connection.js";
+import { setCache } from "../../utilities/redis-connection.js";
 import { insertSettlement } from "./bet-db.js";
 
 export const createGameData = async (matchId, betAmount, mineCount, playerDetails, socket) => {
@@ -56,7 +57,7 @@ export const revealedCells = async (game, playerDetails, row, col, socket) => {
             status: 'LOSS'
         });
         game.matchId = '', game.bank = 0.00, game.multiplier = 0; game.bombPos = `${row}:${col}`
-        await deleteCache(`GM:${playerDetails.id}`);
+        playerGames.delete(`GM:${playerDetails.id}`);
         return { eventName: 'match_ended', game };
     };
     const revealedCountAndMines = countMinesAndRevealed(game.playerGrid);
@@ -70,7 +71,7 @@ export const revealedCells = async (game, playerDetails, row, col, socket) => {
     game.bank = (Number(game.bet) * Number(game.multiplier)).toFixed(2);
     game.currentMultiplier = game.multiplier;
     game.multiplier = getNextMultiplier(game.revealedCellCount);
-    await setCache(`GM:${playerDetails.id}`, JSON.stringify(game), 3600);
+    playerGames.set(`GM:${playerDetails.id}`, game);
     return {
         matchId: game.matchId,
         bank: game.bank,
@@ -96,7 +97,6 @@ export const cashOutAmount = async (game, playerDetails, socket) => {
     playerDetails.balance = (Number(playerDetails.balance) + Number(winAmount)).toFixed(2);
     await setCache(`PL:${playerDetails.socketId}`, JSON.stringify(playerDetails));
     socket.emit('info', { user_id: playerDetails.userId, operator_id: playerDetails.operatorId, balance: playerDetails.balance });
-    await deleteCache(`GM:${playerDetails.id}`);
     await insertSettlement({
         roundId: game.matchId,
         bet_id: game.bet_id,
@@ -104,9 +104,10 @@ export const cashOutAmount = async (game, playerDetails, socket) => {
         userId: playerDetails.userId,
         operatorId: playerDetails.operatorId,
         bet_amount: game.bet,
-        max_mult: game.currentMultiplier,
+        max_mult: game.currentMultiplier || 1.00,
         status: 'WIN'
     });
+    playerGames.delete(`GM:${playerDetails.id}`);
     return {
         payout: winAmount,
         matchId: '',

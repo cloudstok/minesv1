@@ -8,15 +8,37 @@ const gameLogger = createLogger('Game', 'jsonl');
 const betLogger = createLogger('Bets', 'jsonl');
 const cashoutLogger = createLogger('Cashout', 'jsonl');
 const timers = new Map();
+export const playerGames = new Map();
+const userLocks = new Map();
+
+const acquireLock = async (key) => {
+
+    while (userLocks.has(key)) {
+        await userLocks.get(key);
+    }
+
+    let resolveLock = () => { };
+
+    const lockPromise = new Promise((resolve) => {
+        resolveLock = resolve;
+    });
+
+    userLocks.set(key, lockPromise);
+
+    return () => {
+        resolveLock();
+        userLocks.delete(key);
+    };
+};
+
 
 const getPlayerDetailsAndGame = async (socket) => {
     const cachedPlayerDetails = await getCache(`PL:${socket.id}`);
     if (!cachedPlayerDetails) return { error: 'Invalid Player Details' };
     const playerDetails = JSON.parse(cachedPlayerDetails);
 
-    const cachedGame = await getCache(`GM:${playerDetails.id}`);
-    if (!cachedGame) return { error: 'Game Details not found' };
-    const game = JSON.parse(cachedGame);
+    const game = playerGames.get(`GM:${playerDetails.id}`)
+    if (!game) return { error: 'Game Details not found' };
 
     return { playerDetails, game };
 };
@@ -47,56 +69,82 @@ export const emitMinesMultiplier = (socket) => {
 };
 
 export const startGame = async (socket, betData) => {
-    const [betAmount, mineCount] = betData.map(Number);
-    if (!betAmount || !mineCount) return socket.emit('betError', 'Bet Amount and mine count is missing');
-    if (mineCount < 1 || betAmount <= 0) return socket.emit('betError', 'Cheat Detected, Bet cannot be placed');
-    const cachedPlayerDetails = await getCache(`PL:${socket.id}`);
-    if (!cachedPlayerDetails) return socket.emit('betError', 'Invalid Player Details');
-    const playerDetails = JSON.parse(cachedPlayerDetails);
-    const gameLog = { logId: generateUUIDv7(), player: playerDetails, betAmount };
-    if (Number(playerDetails.balance) < betAmount) return logEventAndEmitResponse(gameLog, 'Insufficient Balance', 'game', socket);
-    if ((betAmount < appConfig.minBetAmount) || (betAmount > appConfig.maxBetAmount)) return logEventAndEmitResponse(gameLog, 'Invalid Bet', 'game', socket);
-    const matchId = generateUUIDv7();
-    const game = await createGameData(matchId, betAmount, mineCount, playerDetails, socket);
-    await registerTimer(playerDetails.id, game.matchId, socket);
-    gameLogger.info(JSON.stringify({ ...gameLog, game }));
-    if (game.error) {
-        await clearTimer(playerDetails.id, game.matchId);
-        return emitBetError(socket, game.error)
+    const releaseLock = await acquireLock(socket.id);
+    try {
+        const [betAmount, mineCount] = betData.map(Number);
+        if (!betAmount || !mineCount) return socket.emit('betError', 'Bet Amount and mine count is missing');
+        if (mineCount < 1 || betAmount <= 0) return socket.emit('betError', 'Cheat Detected, Bet cannot be placed');
+        const cachedPlayerDetails = await getCache(`PL:${socket.id}`);
+        if (!cachedPlayerDetails) return socket.emit('betError', 'Invalid Player Details');
+        const playerDetails = JSON.parse(cachedPlayerDetails);
+        const gameLog = { logId: generateUUIDv7(), player: playerDetails, betAmount };
+        if (playerGames.get(`GM:${playerDetails.id}`)) return socket.emit('betError', 'Already a game is active for the user');
+        if (Number(playerDetails.balance) < betAmount) return logEventAndEmitResponse(gameLog, 'Insufficient Balance', 'game', socket);
+        if ((betAmount < appConfig.minBetAmount) || (betAmount > appConfig.maxBetAmount)) return logEventAndEmitResponse(gameLog, 'Invalid Bet', 'game', socket);
+        const matchId = generateUUIDv7();
+        const game = await createGameData(matchId, betAmount, mineCount, playerDetails, socket);
+        await registerTimer(playerDetails.id, game.matchId, socket);
+        gameLogger.info(JSON.stringify({ ...gameLog, game }));
+        if (game.error) {
+            await clearTimer(playerDetails.id, game.matchId);
+            return emitBetError(socket, game.error)
+        };
+        if (!playerGames.has(`GM:${playerDetails.id}`)) playerGames.set(`GM:${playerDetails.id}`, game);
+        return socket.emit("game_started", { matchId: game.matchId, bank: game.bank });
+    } catch (err) {
+        socket.emit('betError', 'Something wnent wrong');
+        return;
+    } finally {
+        releaseLock();
     };
-    await setCache(`GM:${playerDetails.id}`, JSON.stringify(game), 3600);
-    return socket.emit("game_started", { matchId: game.matchId, bank: game.bank });
 };
 
 export const randomCell = async (socket) => {
-    const { playerDetails, game, error } = await getPlayerDetailsAndGame(socket);
-    if (error) return logEventAndEmitResponse({ socketId: socket.id }, error, 'bet', socket);
-    await clearTimer(playerDetails.id, game.matchId);
-    const randomRowColData = getRandomRowCol(game.playerGrid);
-    const result = await revealedCells(game, playerDetails, randomRowColData.row, randomRowColData.col, socket);
-    betLogger.info(JSON.stringify({ matchId: game.matchId, playerDetails, result }));
-    if (result.error) return emitBetError(socket, result.error);
-    if (result.eventName) return socket.emit(result.eventName, result.game || result.cashoutData);
-    await registerTimer(playerDetails.id, game.matchId, socket);
-    return socket.emit("revealed_cell", result);
+    const releaseLock = await acquireLock(socket.id);
+    try {
+        const { playerDetails, game, error } = await getPlayerDetailsAndGame(socket);
+        if (error) return logEventAndEmitResponse({ socketId: socket.id }, error, 'bet', socket);
+        await clearTimer(playerDetails.id, game.matchId);
+        const randomRowColData = getRandomRowCol(game.playerGrid);
+        const result = await revealedCells(game, playerDetails, randomRowColData.row, randomRowColData.col, socket);
+        betLogger.info(JSON.stringify({ matchId: game.matchId, playerDetails, result }));
+        if (result.error) return emitBetError(socket, result.error);
+        if (result.eventName) return socket.emit(result.eventName, result.game || result.cashoutData);
+        await registerTimer(playerDetails.id, game.matchId, socket);
+        return socket.emit("revealed_cell", result);
+    } catch (err) {
+        socket.emit('betError', 'Something wnent wrong');
+        return;
+    } finally {
+        releaseLock();
+    };
 };
 
 export const revealCell = async (socket, cellData) => {
-    const [row, col] = cellData.map(Number);
-    const { playerDetails, game, error } = await getPlayerDetailsAndGame(socket);
-    if (error) return logEventAndEmitResponse({ socketId: socket.id }, error, 'bet', socket);
-    await clearTimer(playerDetails.id, game.matchId);
-    const result = await revealedCells(game, playerDetails, row, col, socket);
-    betLogger.info(JSON.stringify({ matchId: game.matchId, playerDetails, result }));
-    if (result.error) return emitBetError(socket, result.error);
-    if (result.eventName) return socket.emit(result.eventName, result.game || result.cashoutData);
-    await registerTimer(playerDetails.id, game.matchId, socket);
-    return socket.emit("revealed_cell", result);
+    const releaseLock = await acquireLock(socket.id);
+    try {
+        const [row, col] = cellData.map(Number);
+        const { playerDetails, game, error } = await getPlayerDetailsAndGame(socket);
+        if (error) return logEventAndEmitResponse({ socketId: socket.id }, error, 'bet', socket);
+        await clearTimer(playerDetails.id, game.matchId);
+        const result = await revealedCells(game, playerDetails, row, col, socket);
+        betLogger.info(JSON.stringify({ matchId: game.matchId, playerDetails, result }));
+        if (result.error) return emitBetError(socket, result.error);
+        if (result.eventName) return socket.emit(result.eventName, result.game || result.cashoutData);
+        await registerTimer(playerDetails.id, game.matchId, socket);
+        return socket.emit("revealed_cell", result);
+    } catch (err) {
+        socket.emit('betError', 'Something wnent wrong');
+        return;
+    } finally {
+        releaseLock();
+    };
 };
 
 export const cashOut = async (socket) => {
-    const { playerDetails, game, error } = await getPlayerDetailsAndGame(socket);
+    const releaseLock = await acquireLock(socket.id);
     try {
+        const { playerDetails, game, error } = await getPlayerDetailsAndGame(socket);
         if (error) return logEventAndEmitResponse({ socketId: socket.id }, error, 'cashout', socket);
         await clearTimer(playerDetails.id, game.matchId);
         if (Number(game.bank) <= 0) return logEventAndEmitResponse({ socketId: socket.id, matchId: game.matchId, player: playerDetails }, 'Cashout amount cannot be less than or 0', 'cashout', socket);
@@ -104,8 +152,10 @@ export const cashOut = async (socket) => {
         cashoutLogger.info(JSON.stringify({ socketId: socket.id, matchId: game.matchId, playerDetails, winData }));
         return socket.emit("cash_out_complete", winData);
     } catch (error) {
-        console.error("Error during cash out:", error);
-        cashoutLogger.error();
+        cashoutLogger.error(error);
+        return;
+    } finally {
+        releaseLock();
     };
 };
 
@@ -114,7 +164,7 @@ export const disconnect = async (socket) => {
     const cachedPlayerDetails = await getCache(`PL:${socket.id}`);
     if (!cachedPlayerDetails) return socket.disconnect(true);
     const playerDetails = JSON.parse(cachedPlayerDetails);
-    const cachedGame = await getCache(`GM:${playerDetails.id}`);
+    const cachedGame = playerGames.get(`GM:${playerDetails.id}`);
     if (cachedGame) await cashOut(socket);
     await deleteCache(`PL:${socket.id}`);
     console.log("User disconnected:", socket.id);
